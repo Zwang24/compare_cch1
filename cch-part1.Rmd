@@ -1,0 +1,500 @@
+---
+title: "Case-cohort study design I"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(rje) #for expit
+library(survival)
+library(survey)
+```
+
+
+## Simulation w/modifications for efficiency
+```{r}
+bv.simulation <- function(exp.rate, beta, gamma, baseline.hazards,delta, epsilon, zeta) {
+# exp.rate is the exposure rate to HIV
+# beta is the coefficient (intercept) in generating BV status
+# gamma is the coefficient in generate BV status, and varied to control association
+# of HIV exposure and BV status
+########### main body #############
+ # exp.rate=0.3
+ # beta=-1.5
+ # gamma = 6
+ # baseline.hazards = 0.0001405205
+ # delta = log(0.5)
+ # epsilon = 0
+ # zeta =0
+# generate sites and participants, sites 1:10, participants per site 1:250
+sites <- rep(1:10, each = 250)
+participants <- 1:2500
+# generate exposure rates for study sites
+a.set <- seq(exp.rate-0.16,exp.rate+0.20, 0.04)
+# calculate hiv exposure for each site
+HIV.exp <- rbinom(2500,1,a.set) # 40%
+# generate bv status
+bv <- rbinom(2500,1,expit(beta + gamma*HIV.exp)) # 40%, no correlation
+# generate the intervention assignment
+tx <- rep(c(0,1),times = 125)
+# generate the hazards
+# overall HIV incidence of 5% per year
+individual.hazards <- baseline.hazards*exp(delta*tx+epsilon*bv+zeta*tx*bv)
+# set those whose exposure status of 0 to small hazard
+individual.hazards.2 <- ifelse(HIV.exp==0, 0.0001, individual.hazards)
+Time.to.HIV <- rexp(2500, individual.hazards.2)
+# combine and arrange the time to hiv
+sort.time <- sort(Time.to.HIV)
+# add numbering to the dataset
+# set the time to event to NA if  exceed 160 events (study ends when reach 160 events)
+censor.time <- ifelse(Time.to.HIV <= sort.time[160], Time.to.HIV, sort.time[160])
+# identify those top 160 time to events and label them with HIV infection
+HIV.infection <- ifelse(Time.to.HIV <= sort.time[160], 1, 0)
+data.frame(sites,participants,HIV.exp,bv,tx,individual.hazards.2,censor.time,HIV.infection)
+}
+# test the function
+set.seed(1)
+bv.sim <- bv.simulation(0.3, -1.5, 6, 0.0001405205, log(0.5), 0, 0)
+bv.sim %>% filter(HIV.exp == 1)%>% 
+  summarise(prop = mean(bv)) %>%
+                    .$prop # want this to be close to 1
+bv.sim %>% filter(HIV.exp == 0)%>% 
+  summarise(prop = mean(bv)) %>%
+                    .$prop # want this to be close to 0.2
+bv.sim %>% filter(sites == "5") %>%
+ summarise(prop = mean(HIV.exp)) %>%
+                    .$prop # should be close to 30%
+# check the hiv incidence in the control arm
+bv.sim %>% filter(tx == 0)%>% 
+  summarise(prop = mean(HIV.infection)) %>%
+                    .$prop # want this to be close to 0.05
+```
+
+```{r}
+  # the first set of test is on the placebo group
+  placebo <- bv.sim %>% filter(tx == 0)
+################## normal cox
+  cox.res <- coxph(Surv(Time.to.HIV, HIV.infection) ~ bv, placebo)
+  cox.strat <- coxph(Surv(Time.to.HIV, HIV.infection) ~ bv + strata(sites), placebo)
+  # strata(sites)
+################## srs
+  sel.sub <- sample(placebo$participants,125,replace = F)
+  placebo$sel.sub <- ifelse(placebo$participants %in% sel.sub, 1, 0)
+  selccoh <- with(placebo, HIV.infection==1|sel.sub==1)
+  sim.subco <- placebo[selccoh,]
+  stratsizes <- table(placebo$sites)
+  cch1 <- cch(Surv(Time.to.HIV, HIV.infection) ~ bv, data = sim.subco, #placebo[filterings]
+   subcoh = ~sel.sub, id=~participants, cohort.size=1250, method="Prentice") # stratum = ~ sites
+  # stratified
+  cch1.strat <- cch(Surv(Time.to.HIV, HIV.infection) ~ bv, data = sim.subco, #placebo[filterings]
+   subcoh = ~sel.sub, id=~participants,stratum = ~sites, cohort.size=stratsizes, method="I.Borgan") # stratum = ~ sites
+  
+################## covariate adjusted method 1
+  incident.per.site <- function(a) {
+  placebo %>% filter(sites == a) %>%
+  summarise(prop = sum(HIV.infection)) %>%
+                    .$prop}
+  HIV.probs.list <- as.numeric(lapply(placebo$sites, incident.per.site))/sum(placebo$HIV.infection) # tabulate
+  indexes.proportion <- sample(placebo$participants, size = 125, prob = HIV.probs.list[1:1250], replace =   FALSE)
+  placebo$site.sel.proportion <- ifelse(placebo$participants %in% indexes.proportion, 1, 0)
+  # apply the subcohort analysis
+  site.selccoh <- with(placebo, HIV.infection==1|site.sel.proportion==1) ## cases in the subcohort
+  # creating the subcohort dataset from the full cohort dataset
+  site.sim.subco <- placebo[site.selccoh,]
+  site.fit <- cch(Surv(Time.to.HIV, HIV.infection) ~ bv, data =site.sim.subco,
+              subcoh = ~site.sel.proportion, id=~participants, cohort.size=1250, method="Pren")
+  site.fit.strat <- cch(Surv(Time.to.HIV, HIV.infection) ~ bv, data =site.sim.subco,
+              subcoh = ~site.sel.proportion, id=~participants,stratum = ~sites ,cohort.size=stratsizes, method="I.Borgan")
+  
+################# covariate adjusted method 2
+  logit1 <- glm(HIV.infection~as.factor(sites), data=placebo, family = "binomial")
+  ## use the original method posted in the MORGAM paper to get the probability of getting infection
+  placebo$Site.prob <- predict(logit1, newdata = placebo, type = "response")
+  indexes.logit <- sample(placebo$participants, size = 125, prob = placebo$Site.prob[1:1250], replace = FALSE)
+  # generating the dataset
+  placebo$site.sel.logit <- ifelse(placebo$participants %in% indexes.logit, 1, 0)
+  # apply the subcohort analysis
+  site.selccoh.logit <- with(placebo, HIV.infection==1|site.sel.logit==1) ## cases in the subcohort
+  # creating the subcohort dataset from the full cohort dataset
+  site.subco.logit <- placebo[site.selccoh.logit,]
+  # run subcohort analysis using the cch function with Prentice method
+  site.fit.logit <- cch(Surv(Time.to.HIV, HIV.infection) ~ bv, data =site.subco.logit,
+              subcoh = ~site.sel.logit, id=~participants, cohort.size=1250, method="Pren") #Borgan
+  site.fit.logit.strat <- cch(Surv(Time.to.HIV, HIV.infection) ~ bv, data =site.subco.logit,
+              subcoh = ~site.sel.logit, id=~participants,stratum = ~sites, cohort.size=stratsizes, method="I.Borgan") #Borgan
+  # results
+one.result <- matrix(c(cox.res$coefficients, cox.res$var, 
+           cox.strat$coefficients,cox.strat$var,
+           cch1$coefficients, cch1$var,
+           cch1.strat$coefficients,cch1.strat$var,
+           site.fit$coefficients, site.fit$var,
+           site.fit.strat$coefficients, site.fit.strat$var,
+           site.fit.logit$coefficients, site.fit.logit$var,
+           site.fit.logit.strat$coefficients, site.fit.logit.strat$var), 
+         nrow = 1, byrow = TRUE)
+ 
+one.mean <-  c(one.result[1], one.result[3],one.result[5],one.result[7],one.result[9],one.result[11],one.result[13],               one.result[15])
+one.var <- c(one.result[2], one.result[4],one.result[6],one.result[8],one.result[10],one.result[12],one.result[14],
+             one.result[16])
+one.dat <- data.frame(one.mean,one.var)
+rownames(one.dat) <- c("Cox regresion on the placebo arm",
+                       "Cox regresion on the placebo arm + stratification",
+                          "Case-cohort analysis - SRS",
+                       "Stratified Case-cohort analysis - SRS",
+                          "Case-cohort analysis - baseline M1",
+                       "Stratified Case-cohort analysis - baseline M1",
+                          "Case-cohort analysis - baseline M2",
+                       "Stratified Case-cohort analysis - baseline M2")
+colnames(one.dat) <- c("Sample mean","Sample variance")
+one.dat
+```
+# Function 1: the combined function for testing BV among the placebo group
+```{r}
+bv.function <- function(a,b,c){ # add a stratification by site
+  # the dataset
+  bv.sim <- bv.simulation(0.3, -1.5, 6, 0.0001405205, a,b,c)
+  # the first set of test is on the placebo group
+  placebo <- bv.sim %>% filter(tx == 0)
+################## normal cox
+  cox.res <- coxph(Surv(Time.to.HIV, HIV.infection) ~ bv, placebo)
+  # strata(sites)
+################## srs
+  sel.sub <- sample(placebo$participants,125,replace = F)
+  placebo$sel.sub <- ifelse(placebo$participants %in% sel.sub, 1, 0)
+  selccoh <- with(placebo, HIV.infection==1|sel.sub==1)
+  sim.subco <- placebo[selccoh,]
+  cch1 <- cch(Surv(Time.to.HIV, HIV.infection) ~ bv, data = sim.subco, #placebo[filterings]
+   subcoh = ~sel.sub, id=~participants, cohort.size=1250, method="Prentice") # stratum = ~ sites
+  
+################## covariate adjusted method 1
+  incident.per.site <- function(a) {
+  placebo %>% filter(sites == a) %>%
+  summarise(prop = sum(HIV.infection)) %>%
+                    .$prop}
+  HIV.probs.list <- as.numeric(lapply(placebo$sites, incident.per.site))/sum(placebo$HIV.infection) # tabulate
+  indexes.proportion <- sample(placebo$participants, size = 125, prob = HIV.probs.list[1:1250], replace =   FALSE)
+  placebo$site.sel.proportion <- ifelse(placebo$participants %in% indexes.proportion, 1, 0)
+  # apply the subcohort analysis
+  site.selccoh <- with(placebo, HIV.infection==1|site.sel.proportion==1) ## cases in the subcohort
+  # creating the subcohort dataset from the full cohort dataset
+  site.sim.subco <- placebo[site.selccoh,]
+  site.fit <- cch(Surv(Time.to.HIV, HIV.infection) ~ bv, data =site.sim.subco,
+              subcoh = ~site.sel.proportion, id=~participants, cohort.size=1250, method="Pren")
+  
+################# covariate adjusted method 2
+  logit1 <- glm(HIV.infection~as.factor(sites), data=placebo, family = "binomial")
+  ## use the original method posted in the MORGAM paper to get the probability of getting infection
+  placebo$Site.prob <- predict(logit1, newdata = placebo, type = "response")
+  indexes.logit <- sample(placebo$participants, size = 125, prob = placebo$Site.prob[1:1250], replace = FALSE)
+  # generating the dataset
+  placebo$site.sel.logit <- ifelse(placebo$participants %in% indexes.logit, 1, 0)
+  # apply the subcohort analysis
+  site.selccoh.logit <- with(placebo, HIV.infection==1|site.sel.logit==1) ## cases in the subcohort
+  # creating the subcohort dataset from the full cohort dataset
+  site.subco.logit <- placebo[site.selccoh.logit,]
+  # run subcohort analysis using the cch function with Prentice method
+  site.fit.logit <- cch(Surv(Time.to.HIV, HIV.infection) ~ bv, data =site.subco.logit,
+              subcoh = ~site.sel.logit, id=~participants, cohort.size=1250, method="Pren") #Borgan
+  # results
+  matrix(c(cox.res$coefficients, cox.res$var, cch1$coefficients, cch1$var,
+           site.fit$coefficients, site.fit$var, site.fit.logit$coefficients, site.fit.logit$var), 
+         nrow = 1, byrow = TRUE)
+}
+
+bv.function(log(0.5), 0, 0)
+
+mat.1 <- replicate(1000, bv.function(log(0.5), 0, 0))
+first.set <- matrix(mat.1, nrow = 1000, byrow = TRUE)
+result1.mean <- apply(first.set, 2, mean)
+result1.sd <- apply(first.set, 2, sd)
+mean1 <- c(result1.mean[1], result1.mean[3],result1.mean[5],result1.mean[7])
+var1 <- c(result1.mean[2], result1.mean[4],result1.mean[6],result1.mean[8])
+sd.mean1 <- c(result1.sd[1], result1.sd[3],result1.sd[5],result1.sd[7])
+sd.var1 <- c(result1.sd[2], result1.sd[4],result1.sd[6],result1.sd[8])
+result1 <- data.frame(mean1,var1,sd.mean1,sd.var1)
+rownames(result1) <- c("Cox regresion on the placebo arm",
+                          "Case-cohort analysis - SRS",
+                          "Case-cohort analysis - baseline M1",
+                          "Case-cohort analysis - baseline M2")
+colnames(result1) <- c("Average sample mean","Average sample variance","Sample standard deviation","Sample SD of variance")
+result1
+```
+# Function 2: the combined function to test the interaction term
+```{r}
+bv.EF.function <- function(a,b,c){
+  # the dataset
+  bv.sim <- bv.simulation(0.3, -1.5, 6, 0.0001405205, a,b,c)
+################## normal cox
+  cox.res <- coxph(Surv(Time.to.HIV, HIV.infection) ~ bv*tx, bv.sim)
+  
+################## srs
+  sel.sub <- sample(bv.sim$participants,250,replace = F)
+  bv.sim$sel.sub <- ifelse(bv.sim$participants %in% sel.sub, 1, 0)
+  selccoh <- with(bv.sim, HIV.infection==1|sel.sub==1)
+  sim.subco <- bv.sim[selccoh,]
+  cch1 <- cch(Surv(Time.to.HIV, HIV.infection) ~ bv*tx, data =sim.subco,
+   subcoh = ~sel.sub, id=~participants, cohort.size=2500, method="Prentice")
+  
+################## covariate adjusted method 1
+  incident.per.site <- function(a) {
+  bv.sim %>% filter(sites == a) %>%
+  summarise(prop = sum(HIV.infection)) %>%
+                    .$prop}
+  HIV.probs.list <- as.numeric(lapply( bv.sim$sites, incident.per.site))/sum( bv.sim$HIV.infection)
+  indexes.proportion <- sample( bv.sim$participants, size = 250, prob = HIV.probs.list[1:2500], replace =   FALSE)
+   bv.sim$site.sel.proportion <- ifelse( bv.sim$participants %in% indexes.proportion, 1, 0)
+  # apply the subcohort analysis
+  site.selccoh <- with( bv.sim, HIV.infection==1|site.sel.proportion==1) ## cases in the subcohort
+  # creating the subcohort dataset from the full cohort dataset
+  site.sim.subco <-  bv.sim[site.selccoh,]
+  site.fit <- cch(Surv(Time.to.HIV, HIV.infection) ~ bv*tx, data =site.sim.subco,
+              subcoh = ~site.sel.proportion, id=~participants, cohort.size=2500, method="Pren")
+  
+################# covariate adjusted method 2
+  logit1 <- glm(HIV.infection~as.factor(sites), data= bv.sim, family = "binomial")
+  ## use the original method posted in the MORGAM paper to get the probability of getting infection
+  bv.sim$Site.prob <- predict(logit1, newdata =  bv.sim, type = "response")
+  indexes.logit <- sample( bv.sim$participants, size = 250, prob =  bv.sim$Site.prob[1:2500], replace = FALSE)
+  # generating the dataset
+   bv.sim$site.sel.logit <- ifelse( bv.sim$participants %in% indexes.logit, 1, 0)
+  # apply the subcohort analysis
+  site.selccoh.logit <- with( bv.sim, HIV.infection==1|site.sel.logit==1) ## cases in the subcohort
+  # creating the subcohort dataset from the full cohort dataset
+  site.subco.logit <-  bv.sim[site.selccoh.logit,]
+  # run subcohort analysis using the cch function with Prentice method
+  site.fit.logit <- cch(Surv(Time.to.HIV, HIV.infection) ~ bv*tx, data =site.subco.logit,
+              subcoh = ~site.sel.logit, id=~participants, cohort.size=2500, method="Pren")
+  # results
+matrix(c(cox.res$coefficients[1], cox.res$coefficients[2],cox.res$coefficients[3],
+         cox.res$var[1],cox.res$var[2],cox.res$var[3],
+         cch1$coefficients[1], cch1$coefficients[2],cch1$coefficients[3],
+         cch1$var[1],cch1$var[2],cch1$var[3],
+         site.fit$coefficients[1], site.fit$coefficients[2],site.fit$coefficients[3],
+         site.fit$var[1],site.fit$var[2],site.fit$var[3],
+         site.fit.logit$coefficients[1], site.fit.logit$coefficients[2],site.fit.logit$coefficients[3],
+         site.fit.logit$var[1],site.fit.logit$var[2],site.fit.logit$var[3]), nrow = 1, byrow = TRUE)
+}
+bv.EF.function(log(0.5), 0, 0)
+
+mat.2 <- replicate(1000, bv.EF.function(log(0.5), 0, 0)) # save this into a R data
+save(mat.2,file = "Result2.RData")
+second.set <- matrix(mat.2, nrow = 1000, byrow = TRUE)
+save(second.set,file = "Result2.RData")
+result2.mean <- apply(second.set, 2, mean)
+result2.sd <- apply(second.set, 2, sd)
+mean2.beta1 <- c(result2.mean[1], result2.mean[7],result2.mean[13],result2.mean[19])
+mean2.beta2 <- c(result2.mean[2], result2.mean[8],result2.mean[14],result2.mean[20])
+mean2.beta3 <- c(result2.mean[3], result2.mean[9],result2.mean[15],result2.mean[21])
+var2.beta1 <-  c(result2.mean[4], result2.mean[10],result2.mean[16],result2.mean[22])
+var2.beta2 <-  c(result2.mean[5], result2.mean[11],result2.mean[17],result2.mean[23])
+var2.beta3 <-  c(result2.mean[6], result2.mean[12],result2.mean[18],result2.mean[24])
+sd.mean.beta1 <- c(result2.sd[1], result2.sd[7],result2.sd[13],result2.sd[19])
+sd.mean.beta2 <- c(result2.sd[2], result2.sd[8],result2.sd[14],result2.sd[20])
+sd.mean.beta3 <- c(result2.sd[3], result2.sd[9],result2.sd[15],result2.sd[21])
+sd.var.beta1 <- c(result2.sd[4], result2.sd[10],result2.sd[16],result2.sd[22])
+sd.var.beta2 <- c(result2.sd[5], result2.sd[11],result2.sd[17],result2.sd[23])
+sd.var.beta3 <- c(result2.sd[6], result2.sd[12],result2.sd[18],result2.sd[24])
+result2 <- data.frame(mean2.beta1,mean2.beta2,mean2.beta3,var2.beta1,var2.beta2,var2.beta3,
+              sd.mean.beta1,sd.mean.beta2,sd.mean.beta3,
+              sd.var.beta1,sd.var.beta2,sd.var.beta3)
+rownames(result2) <- c("Cox regresion on everyone",
+                          "Case-cohort analysis - SRS",
+                          "Case-cohort analysis - baseline M1",
+                          "Case-cohort analysis - baseline M2")
+colnames(result2) <- c("B1 average sample mean", "B2 average sample mean","B3 average sample mean",
+                       "B1 average variance","B2 average variance","B3 average variance",
+                       "B1 SD of sample mean","B2 SD of sample mean","B3 SD of sample mean",
+                       "B1 SD of variance","B2 SD of variance","B3 SD of variance")
+result2
+mat.2
+```
+
+# The two-phase sampling method in Survey package
+# the simulation function
+Get the exposure and bv not correlated to see the outcomes.
+```{r simulation}
+bv.simulation.2 <- function(exp.rate, beta, gamma, baseline.hazards, epsilon) {
+# exp.rate is the exposure rate to HIV
+# beta is the coefficient (intercept) in generating BV status
+# gamma is the coefficient in generate BV status, and varied to control association
+# of HIV exposure and BV status
+  ########### main body #############
+# generate sites and participants, sites 1:10, participants per site 1:250
+sites <- rep(1:10, each = 250)
+participants <- 1:2500
+# generate exposure rates for study sites
+# a.set <- seq(exp.rate-0.16,exp.rate+0.20, 0.04)
+# calculate hiv exposure for each site
+HIV.exp <- rbinom(2500,1,exp.rate) # varying by site as the original simulation plan
+# generate bv status
+bv <- rbinom(2500,1,expit(beta + gamma*HIV.exp))# correlation with HIV exp varies, increase gamma and cut beta
+# generate the intervention assignment
+# tx <- rep(c(0,1),times = 125)
+# generate the hazards
+# overall HIV incidence of 5% per year
+individual.hazards <- baseline.hazards*exp(epsilon*bv) # only epsilon
+# set those whose exposure status of 0 to small hazard
+individual.hazards.2 <- ifelse(HIV.exp==0, 0.00001, individual.hazards)
+Time.to.HIV <- rexp(2500, individual.hazards.2)
+# combine and arrange the time to hiv
+sort.time <- sort(Time.to.HIV)
+sort.time[160]
+# add numbering to the dataset
+# set the time to event to NA if  exceed 160 events (study ends when reach 160 events)
+Time.to.HIV <- ifelse(Time.to.HIV <= sort.time[160], Time.to.HIV, sort.time[160]+1)
+# identify those top 160 time to events and label them with HIV infection
+HIV.infection <- ifelse(Time.to.HIV <= sort.time[160], 1, 0)
+data.frame(sites,participants,HIV.exp,bv,individual.hazards.2,Time.to.HIV,HIV.infection)
+} # wait until the end to combine the data
+# test the function
+bv.sim.2 <- bv.simulation.2(0.4, -1.5, 2.5, 0.0001405205, 0)
+
+bv.sim.2 %>% summarise(prop = mean(bv)) %>%
+                    .$prop  # should be close to 40%
+bv.sim.2 %>% summarise(prop = mean(HIV.exp)) %>%
+                    .$prop # should be close to 40%
+```
+
+# Implementing the survey package: Lin & Ying
+```{r}
+# simple random
+rep.svy.LY <- function(hiv.exp, beta, gamma) {
+bv.sim.2 <- bv.simulation.2(hiv.exp, beta, gamma, 0.0001405205, 0)
+
+sel.sub <- sample(bv.sim.2$participants,250,replace = F)
+bv.sim.2$sel.sub <- ifelse(bv.sim.2$participants %in% sel.sub, 1, 0)
+
+dcch<-twophase(id=list(~participants,~participants), strata=list(NULL,~HIV.infection),
+                  subset=~I(sel.sub | HIV.infection), data=bv.sim.2)
+fit1 <- svycoxph(Surv(Time.to.HIV,HIV.infection)~bv+strata(sites),
+                design=dcch)
+# probabilities
+rates <- rep(0,10)
+  for (i in 1:10) {
+  rates[i] <- bv.sim.2 %>% filter(sites == i) %>%
+  summarise(prop = mean(HIV.infection)) %>%
+                    .$prop
+  }
+  HIV.probs.list <- rep(rates, each = 250)# tabulate
+  indexes.proportion <- sample(bv.sim.2$participants, size = 250, prob = HIV.probs.list, replace =   FALSE)
+  bv.sim.2$site.sel.proportion <- ifelse(bv.sim.2$participants %in% indexes.proportion, 1, 0)
+
+dcch.site1<-twophase(id=list(~participants,~participants), strata=list(NULL,~HIV.infection),
+                  subset=~I(site.sel.proportion | HIV.infection), data=bv.sim.2)
+fit2 <- svycoxph(Surv(Time.to.HIV,HIV.infection)~bv+strata(sites),
+                design=dcch.site1)
+# logistic
+  logit1 <- glm(HIV.infection~as.factor(sites), data=bv.sim.2, family = "binomial")
+  ## use the original method posted in the MORGAM paper to get the probability of getting infection
+  bv.sim.2$Site.prob <- predict(logit1, newdata = bv.sim.2, type = "response")
+  indexes.logit <- sample(bv.sim.2$participants, size = 250, prob = bv.sim.2$Site.prob[1:2500], replace = FALSE)
+  # generating the dataset
+  bv.sim.2$site.sel.logit <- ifelse(bv.sim.2$participants %in% indexes.logit, 1, 0)
+dcch.site2<-twophase(id=list(~participants,~participants), strata=list(NULL,~HIV.infection),
+                  subset=~I(site.sel.logit | HIV.infection), data=bv.sim.2)
+fit3 <- svycoxph(Surv(Time.to.HIV,HIV.infection)~bv+strata(sites),
+                design=dcch.site2)
+matrix(c(fit1$coefficients,fit1$var,
+         fit2$coefficients,fit2$var,
+         fit3$coefficients,fit3$var), byrow = TRUE)
+}
+mat1 <- replicate(1000,rep.svy.LY(0.4, -1.5, 2.5))
+
+convert_to_table <- function(dataset,n) {
+first.set <- matrix(dataset, nrow = n, byrow = TRUE)
+result1.mean <- apply(first.set, 2, mean)
+table1 <- matrix(result1.mean, nrow = 3, byrow = TRUE)
+colnames(table1) <- c("mean","variance")
+rownames(table1) <- c("SRS","Baseline-adjusted 1","Baseline-adjusted 2")
+table1
+}
+
+```
+# Implementing the stratified design (Borgan)
+```{r}
+
+rep.svy.Borgan <- function(hiv.exp, beta, gamma) {
+bv.sim.2 <- bv.simulation.2(hiv.exp, beta, gamma, 0.0001405205, 0)
+
+sel.sub <- sample(bv.sim.2$participants,250,replace = F)
+bv.sim.2$sel.sub <- ifelse(bv.sim.2$participants %in% sel.sub, 1, 0)
+
+d_BorganII <- twophase(id=list(~participants,~participants), strata=list(NULL,~interaction(sites,HIV.infection)),
+                  subset=~I(sel.sub | HIV.infection), data=bv.sim.2)
+b1 <-svycoxph(Surv(Time.to.HIV,HIV.infection)~bv+strata(sites),
+                design=d_BorganII)
+# probabilities
+rates <- rep(0,10)
+  for (i in 1:10) {
+  rates[i] <- bv.sim.2 %>% filter(sites == i) %>%
+  summarise(prop = mean(HIV.infection)) %>%
+                    .$prop
+  }
+  HIV.probs.list <- rep(rates, each = 250)# tabulate
+  indexes.proportion <- sample(bv.sim.2$participants, size = 250, prob = HIV.probs.list, replace =   FALSE)
+  bv.sim.2$site.sel.proportion <- ifelse(bv.sim.2$participants %in% indexes.proportion, 1, 0)
+
+borgan.site1<-twophase(id=list(~participants,~participants), strata=list(NULL,~interaction(sites,HIV.infection)),
+                  subset=~I(site.sel.proportion | HIV.infection), data=bv.sim.2)
+b2 <- svycoxph(Surv(Time.to.HIV,HIV.infection)~bv+strata(sites),
+                design=borgan.site1)
+
+# logistic
+  logit1 <- glm(HIV.infection~as.factor(sites), data=bv.sim.2, family = "binomial")
+  ## use the original method posted in the MORGAM paper to get the probability of getting infection
+  bv.sim.2$Site.prob <- predict(logit1, newdata = bv.sim.2, type = "response")
+  indexes.logit <- sample(bv.sim.2$participants, size = 250, prob = bv.sim.2$Site.prob[1:2500], replace = FALSE)
+  # generating the dataset
+  bv.sim.2$site.sel.logit <- ifelse(bv.sim.2$participants %in% indexes.logit, 1, 0)
+
+borgan.site2<-twophase(id=list(~participants,~participants), strata=list(NULL,~interaction(sites,HIV.infection)),
+                  subset=~I(site.sel.logit | HIV.infection), data=bv.sim.2)
+b3 <- svycoxph(Surv(Time.to.HIV,HIV.infection)~bv+strata(sites),
+                design=borgan.site2)
+matrix(c(b1$coefficients,b1$var,
+         b2$coefficients,b2$var,
+         b3$coefficients,b3$var), byrow = TRUE)
+}
+
+mat2 <- replicate(1000,rep.svy.Borgan(0.4, -1.5, 2.5))
+second.set <- matrix(mat2, nrow = 1000, byrow = TRUE)
+result2.mean <- apply(second.set, 2, mean)
+
+
+```
+
+# Result summary
+```{r}
+exp.rate <- 0.2
+beta <- 0
+gamma <- 6.0
+HIV.exp <- rbinom(2500,1,exp.rate)
+bv <- rbinom(2500,1,expit(beta + gamma*HIV.exp))
+mean(bv)
+
+# 40% HIV, 40% BV, beta = -1.5, gamma = 2.5
+(LY.40.40 <- convert_to_table(mat1, 1000))
+(B.40.40 <- convert_to_table(mat2, 1000))
+# 20% HIV, 20% BV, beta = -1.9, gamma = 2.0
+mat1.20.20 <- replicate(1000,rep.svy.LY(0.2, -1.9, 2.0))
+mat2.20.20 <- replicate(1000,rep.svy.Borgan(0.2, -1.9, 2.0))
+(LY.20.20 <- convert_to_table(mat1.20.20, 1000))
+(B.20.20 <- convert_to_table(mat2.20.20, 1000))
+# 60% HIV, 60% BV, beta = -1.5, gamma = 3.5
+mat1.60.60 <- replicate(1000,rep.svy.LY(0.6, -1.5, 3.5))
+mat2.60.60 <- replicate(1000,rep.svy.Borgan(0.6, -1.5, 3.5))
+(LY.60.60 <- convert_to_table(mat1.60.60, 1000))
+(B.60.60 <- convert_to_table(mat2.60.60, 1000))
+# 60% HIV, 20% BV, beta = -1.7, gamma = 0.5
+mat1.60.20 <- replicate(1000,rep.svy.LY(0.6, -1.7, 0.5))
+mat2.60.20 <- replicate(1000,rep.svy.Borgan(0.6, -1.7, 0.5))
+(LY.60.20 <- convert_to_table(mat1.60.20, 1000))
+(B.60.20 <- convert_to_table(mat2.60.20, 1000))
+# 20% HIV, 60% BV, beta = 0, gamma = 6.0
+mat1.20.60 <- replicate(1000,rep.svy.LY(0.2, 0, 6.0))
+mat2.20.60 <- replicate(1000,rep.svy.Borgan(0.2, 0, 6.0))
+(LY.20.60 <- convert_to_table(mat1.20.60, 1000))
+(B.20.60 <- convert_to_table(mat2.20.60, 1000))
+
+```
